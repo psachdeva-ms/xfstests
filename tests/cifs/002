@@ -1,0 +1,155 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2025
+#
+# FS QA Test No. cifs/002
+#
+# Verify that files opened over CIFS appear in /proc/fs/cifs/open_files,
+# write to them via their file descriptors, close them, and then check
+# /proc/fs/cifs/close_deferred_closes.
+
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -f $tmp.*
+    rm -rf $TEST_DIR/$$
+}
+
+. ./common/filter
+
+_require_test
+
+# Return success (0) if `/proc/fs/cifs/<name>` contains any
+# non-comment, non-empty lines (i.e. at least one entry).
+# Pass the proc filename as the first argument, e.g. "open_files"
+# or "close_deferred_closes".
+_cifs_proc_has_entries()
+{
+    local name="$1"
+    [ -n "$name" ] || return 1
+    local path="/proc/fs/cifs/$name"
+    [ -r "$path" ] || _fail "/proc/fs/cifs/$name unreadable or non-existent"
+
+    local proc_file_contents
+    proc_file_contents="$(< "$path")"
+    printf "%s" "$proc_file_contents" | grep -v '^#' 2>/dev/null |
+	grep -q '[^[:space:]]' && return 0
+
+    return 1
+}
+
+# Check that `/proc/fs/cifs/<name>` contains all of the provided
+# filenames (passed as additional arguments). Returns 0 if every
+# filename was found, non-zero otherwise.
+_cifs_proc_has_files()
+{
+    if [ $# -eq 0 ]; then
+        return 1
+    fi
+
+    local name="$1"
+    [ -n "$name" ] || return 1
+    local path="/proc/fs/cifs/$name"
+    local proc_file_contents
+    proc_file_contents="$(< "$path")"
+
+    shift
+
+    for tgt in "$@"; do
+        if ! grep -Fq -- "$tgt" <<< "$proc_file_contents" 2>/dev/null; then
+	    return 1
+	fi
+    done
+    return 0
+}
+
+# Capture proc values before we run and verify they are empty
+if _cifs_proc_has_entries "open_files" ||
+     _cifs_proc_has_entries "close_deferred_closes"; then
+    sleep 60
+fi
+
+mkdir -p $TEST_DIR/$$/files || _fail "failed to create files dir"
+
+num=5
+declare -a fds
+declare -a files
+
+for i in $(seq 1 $num); do
+    file=$TEST_DIR/$$/files/file${i}
+    touch "$file" || _fail "touch failed for $file"
+    # open file read+write so we can write via the descriptor
+    exec {fd}> "$file" || _fail "open failed for $file"
+    fds+=($fd)
+    files+=("file$i")
+done
+
+echo "files are open"
+
+# give kernel a moment to populate proc entries
+sleep 1
+
+# write a test message to each open descriptor
+for fd in "${fds[@]}"; do
+    printf "%s\n" "testing close_deferred_closes" >&$fd ||
+	_fail "write via fd $fd failed"
+done
+
+# verify each file appears in /proc/fs/cifs/open_files (if proc is present)
+if _cifs_proc_has_entries "open_files"; then
+    if ! _cifs_proc_has_files "open_files" "${files[@]}"; then
+        _fail "files not opened to be deferred closed"
+    fi
+else
+    _fail "/proc/fs/cifs/open_file has no entries"
+fi
+
+echo "'testing close_deferred_closes' written to the all the files"
+
+# close descriptors
+for fd in "${fds[@]}"; do
+    eval "exec ${fd}>&-" 2>/dev/null || true
+done
+
+echo "closed the file descriptors"
+
+# allow the kernel to account for closes
+sleep 1
+
+# as the files are still open on the server they should show up in open_files
+if _cifs_proc_has_entries "open_files"; then
+    if ! _cifs_proc_has_files "open_files" "${files[@]}"; then
+        _fail "files closed already? Something is wrong, check mount options"
+    fi
+else
+    _fail "files closed already? Something is wrong, check mount options"
+fi
+
+# as the files are closed on client, they should also show up in close_deferred_closes
+if _cifs_proc_has_entries "close_deferred_closes"; then
+    if ! _cifs_proc_has_files "close_deferred_closes" "${files[@]}"; then
+        _fail "files not deferred closed, recheck your mount options"
+    fi
+else
+    _fail "/proc/fs/cifs/close_deferred_closes has no entries"
+fi
+
+echo "close_deferred_closes correctly shows all files marked for deferred close"
+
+# verifying if close of all files marked for deferred close immediately works
+
+echo 1 > /proc/fs/cifs/close_deferred_closes 2>/dev/null ||
+    _fail "write to /proc/fs/cifs/close_deferred_closes failed"
+
+if _cifs_proc_has_entries "close_deferred_closes" &&
+	_cifs_proc_has_entries "open_files"; then
+    _fail "files still marked for deferred close after triggering close_all"
+fi
+
+echo -n "test passed"
+
+status=0
+exit

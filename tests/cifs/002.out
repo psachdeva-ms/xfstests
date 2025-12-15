@@ -1,0 +1,6 @@
+QA output created by 002
+files are open
+'testing close_deferred_closes' written to the all the files
+closed the file descriptors
+close_deferred_closes correctly shows all files marked for deferred close
+test passed
